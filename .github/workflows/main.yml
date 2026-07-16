@@ -1,0 +1,288 @@
+name: Build App 121 APK
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+    paths:
+      - "App121_Box64_Extractor_Source*.zip"
+      - ".github/workflows/main.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-121-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build App 121
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Locate App 121 source ZIP
+        id: source
+        run: |
+          set -Eeuo pipefail
+
+          ZIP_FILE="$(
+            find "$GITHUB_WORKSPACE" \
+              -maxdepth 1 \
+              -type f \
+              -iname 'App121_Box64_Extractor_Source*.zip' \
+              | sort \
+              | head -n 1
+          )"
+
+          if [[ -z "$ZIP_FILE" || ! -f "$ZIP_FILE" ]]; then
+            echo "ERROR: App 121 source ZIP was not found."
+            echo
+            echo "Repository files:"
+            find "$GITHUB_WORKSPACE" \
+              -maxdepth 2 \
+              -type f \
+              -printf '%P\n' \
+              | sort
+            exit 1
+          fi
+
+          ZIP_SHA256="$(sha256sum "$ZIP_FILE" | awk '{print $1}')"
+
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
+          echo "zip_sha256=$ZIP_SHA256" >> "$GITHUB_OUTPUT"
+
+          echo "Source ZIP:"
+          echo "$ZIP_FILE"
+
+          echo "Source SHA-256:"
+          echo "$ZIP_SHA256"
+
+      - name: Extract Android project
+        run: |
+          set -Eeuo pipefail
+
+          EXTRACT_ROOT="$RUNNER_TEMP/app121-source"
+
+          rm -rf "$EXTRACT_ROOT"
+          mkdir -p "$EXTRACT_ROOT"
+
+          unzip -q -o "$ZIP_FILE" -d "$EXTRACT_ROOT"
+
+          SETTINGS_FILE="$(
+            find "$EXTRACT_ROOT" \
+              -type f \
+              \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) \
+              | sort \
+              | head -n 1
+          )"
+
+          if [[ -z "$SETTINGS_FILE" || ! -f "$SETTINGS_FILE" ]]; then
+            echo "ERROR: Android project settings file was not found."
+            echo
+            echo "Extracted files:"
+            find "$EXTRACT_ROOT" \
+              -maxdepth 8 \
+              -type f \
+              -printf '%P\n' \
+              | sort
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+
+          if [[ ! -f "$PROJECT_DIR/app/build.gradle.kts" &&
+                ! -f "$PROJECT_DIR/app/build.gradle" ]]; then
+            echo "ERROR: Android app module was not found."
+            exit 1
+          fi
+
+          if [[ ! -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml" ]]; then
+            echo "ERROR: AndroidManifest.xml was not found."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Android project:"
+          echo "$PROJECT_DIR"
+
+          echo "Project files:"
+          find "$PROJECT_DIR" \
+            -maxdepth 4 \
+            -type f \
+            -printf '%P\n' \
+            | sort
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Verify Java
+        run: |
+          set -Eeuo pipefail
+
+          java -version
+          javac -version
+
+          JAVA_MAJOR="$(
+            java -version 2>&1 |
+              sed -n '1s/.*version "\([0-9][0-9]*\).*/\1/p'
+          )"
+
+          if [[ -z "$JAVA_MAJOR" || "$JAVA_MAJOR" -lt 17 ]]; then
+            echo "ERROR: Java 17 or newer is required."
+            exit 1
+          fi
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          set -Eeuo pipefail
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          echo "sdkmanager:"
+          sdkmanager --version
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+          cache-read-only: false
+
+      - name: Validate Gradle project
+        run: |
+          set -Eeuo pipefail
+
+          cd "$PROJECT_DIR"
+
+          gradle projects \
+            --no-daemon \
+            --stacktrace
+
+      - name: Build App 121 APK
+        run: |
+          set -Eeuo pipefail
+
+          cd "$PROJECT_DIR"
+
+          gradle \
+            :app:assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            --warning-mode all
+
+      - name: Locate and validate generated APK
+        id: apk
+        run: |
+          set -Eeuo pipefail
+
+          APK_FILE="$(
+            find "$PROJECT_DIR/app/build/outputs/apk/debug" \
+              -type f \
+              -name '*.apk' \
+              | sort \
+              | head -n 1
+          )"
+
+          if [[ -z "$APK_FILE" || ! -f "$APK_FILE" ]]; then
+            echo "ERROR: APK was not generated."
+            echo
+            echo "Build output files:"
+            find "$PROJECT_DIR/app/build" \
+              -type f \
+              -printf '%P\n' \
+              | sort \
+              | sed -n '1,300p'
+            exit 1
+          fi
+
+          OUTPUT_DIR="$RUNNER_TEMP/app121-output"
+          OUTPUT_APK="$OUTPUT_DIR/App-121-Box64-Extractor.apk"
+
+          rm -rf "$OUTPUT_DIR"
+          mkdir -p "$OUTPUT_DIR"
+
+          cp "$APK_FILE" "$OUTPUT_APK"
+
+          APK_SHA256="$(sha256sum "$OUTPUT_APK" | awk '{print $1}')"
+          APK_SIZE="$(stat -c '%s' "$OUTPUT_APK")"
+
+          printf '%s  %s\n' \
+            "$APK_SHA256" \
+            "$(basename "$OUTPUT_APK")" \
+            > "$OUTPUT_APK.sha256"
+
+          unzip -t "$OUTPUT_APK"
+
+          echo "OUTPUT_DIR=$OUTPUT_DIR" >> "$GITHUB_ENV"
+          echo "apk_sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
+          echo "apk_size=$APK_SIZE" >> "$GITHUB_OUTPUT"
+
+          echo "Generated APK:"
+          ls -lh "$OUTPUT_APK"
+
+          echo "APK SHA-256:"
+          echo "$APK_SHA256"
+
+      - name: Upload App 121 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: App-121-Box64-Extractor-${{ github.run_number }}
+          path: |
+            ${{ env.OUTPUT_DIR }}/App-121-Box64-Extractor.apk
+            ${{ env.OUTPUT_DIR }}/App-121-Box64-Extractor.apk.sha256
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: App-121-failure-diagnostics-${{ github.run_number }}
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/reports/**
+            ${{ env.PROJECT_DIR }}/app/build/outputs/**
+            ${{ env.PROJECT_DIR }}/.gradle/**
+          if-no-files-found: ignore
+          retention-days: 14
+          compression-level: 6
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## App 121 build summary"
+            echo
+            echo "- Source ZIP SHA-256: \`${{ steps.source.outputs.zip_sha256 }}\`"
+            echo "- APK SHA-256: \`${{ steps.apk.outputs.apk_sha256 || 'not-generated' }}\`"
+            echo "- APK size: \`${{ steps.apk.outputs.apk_size || 'not-generated' }} bytes\`"
+            echo
+            echo "Expected artifact:"
+            echo
+            echo "\`App-121-Box64-Extractor-${{ github.run_number }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
