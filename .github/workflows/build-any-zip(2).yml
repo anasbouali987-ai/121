@@ -152,5 +152,6 @@ jobs:
         with:
           name: zip-debug-apks
           path: .zip-build/apks/*.apk
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
